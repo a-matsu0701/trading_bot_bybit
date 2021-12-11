@@ -25,7 +25,6 @@ wss_url = {
 
 pips = 0.5
 symbol = "BTCUSD"
-buy_entry, sell_entry, retouch_20 = False, False, False
 
 
 def calc_indicators(df):
@@ -156,6 +155,15 @@ async def main():
                         },
                     )
                 else:
+                    # 注文が2件以上の場合、全てキャンセル
+                    if len(order) >= 2:
+                        await client.post(
+                            "/v2/private/order/cancelAll",
+                            data={
+                                "symbol": symbol,
+                            },
+                        )
+
                     # 買い方向のパーフェクトオーダー
                     if (
                         df_1bf["5EMA"] > df_1bf["9EMA"]
