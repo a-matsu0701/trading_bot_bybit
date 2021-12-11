@@ -30,19 +30,21 @@ buy_entry, sell_entry, retouch_20 = False, False, False
 
 def calc_indicators(df):
     # インジケーター
+    df["5EMA"] = talib.EMA(df["close"], timeperiod=5)
     df["9EMA"] = talib.EMA(df["close"], timeperiod=9)
-    df["20EMA"] = talib.EMA(df["close"], timeperiod=20)
     df["45EMA"] = talib.EMA(df["close"], timeperiod=45)
-    df["100EMA"] = talib.EMA(df["close"], timeperiod=100)
     df["ATR"] = talib.ATR(df["high"], df["low"], df["close"], timeperiod=15)
+    # ATRでエントリー指値距離を計算
+    entry_dist = df["ATR"] * 0.5
+    entry_dist = np.maximum(1, (entry_dist / pips).round().fillna(1)) * pips
     # エントリー指値価格
-    df["buy_price"] = df["close"] + pips
-    df["sell_price"] = df["close"] - pips
+    df["buy_price"] = df["close"] - entry_dist
+    df["sell_price"] = df["close"] + entry_dist
+    # ATRで決済指値距離を計算
+    settlement_dist = np.maximum(1, (df["ATR"] / pips).round().fillna(1)) * pips
     # 決済指値を計算
-    limit_price_dist = df["ATR"] * 1.5
-    limit_price_dist = np.maximum(2, (limit_price_dist / pips).round().fillna(2)) * pips
-    df["buy_limit"] = df["close"] - limit_price_dist
-    df["sell_limit"] = df["close"] + limit_price_dist
+    df["buy_limit"] = df["close"] - settlement_dist
+    df["sell_limit"] = df["close"] + settlement_dist
 
     return df
 
@@ -86,7 +88,6 @@ async def main():
         )
         df = calc_indicators(df)
 
-        # df["open_time"] = pd.to_datetime(df["open_time"], unit="s")
         print(df)
 
         # WebSocket接続
@@ -136,45 +137,42 @@ async def main():
                 df = calc_indicators(df)
                 # 確定した1分足データ
                 df_1bf = df.iloc[-2]
-                df_2bf = df.iloc[-3]
 
-                # 買い方向のパーフェクトオーダー
-                if (
-                    df_1bf["9EMA"] > df_1bf["20EMA"]
-                    and df_1bf["20EMA"] > df_1bf["100EMA"]
-                ):
-                    # 未執行の注文があればキャンセル
-                    if buy_entry and len(order) > 0:
-                        await client.post(
-                            "/v2/private/order/cancelAll",
-                            data={
-                                "symbol": symbol,
-                            },
-                        )
-                    # 未決済ポジションがあれば決済指値をトレール
-                    if len(position) > 0 and position[0]["side"] == "Buy":
-                        await client.post(
-                            "/v2/private/position/trading-stop",
-                            data={
-                                "symbol": symbol,
-                                "stop_loss": df_1bf["buy_limit"],
-                            },
-                        )
-                    else:
-                        # 20EMA再タッチ判定
-                        if buy_entry and not retouch_20:
-                            if (
-                                df_1bf["low"] <= df_1bf["20EMA"]
-                                and df_1bf["20EMA"] < df_1bf["close"]
-                            ) or (
-                                df_2bf["close"] <= df_1bf["20EMA"]
-                                and df_1bf["20EMA"] < df_1bf["close"]
-                            ):
-                                retouch_20 = True
-                        # パーフェクトオーダー後初エントリーまたは20EMA再タッチからエントリー
-                        if not buy_entry or retouch_20:
-                            buy_entry = True
-                            retouch_20 = False
+                # 未決済ポジションがあれば決済指値をトレール、なければ条件合致で指値注文
+                if len(position) > 0 and position[0]["side"] == "Buy":
+                    await client.post(
+                        "/v2/private/position/trading-stop",
+                        data={
+                            "symbol": symbol,
+                            "stop_loss": df_1bf["buy_limit"],
+                        },
+                    )
+                elif len(position) > 0 and position[0]["side"] == "Sell":
+                    await client.post(
+                        "/v2/private/position/trading-stop",
+                        data={
+                            "symbol": symbol,
+                            "stop_loss": df_1bf["sell_limit"],
+                        },
+                    )
+                else:
+                    # 買い方向のパーフェクトオーダー
+                    if (
+                        df_1bf["5EMA"] > df_1bf["9EMA"]
+                        and df_1bf["9EMA"] > df_1bf["45EMA"]
+                    ):
+                        # 未執行の買い注文があれば指値変更
+                        if len(order) > 0 and order[0]["side"] == "Buy":
+                            await client.post(
+                                "/v2/private/order/replace",
+                                data={
+                                    "order_id": order[0]["order_id"],
+                                    "symbol": symbol,
+                                    "p_r_price": df_1bf["buy_price"],
+                                    "stop_loss": df_1bf["buy_limit"],
+                                },
+                            )
+                        else:
                             # 新規買い指値注文
                             await client.post(
                                 "/v2/private/order/create",
@@ -188,55 +186,34 @@ async def main():
                                     "time_in_force": "GoodTillCancel",
                                 },
                             )
-                else:
-                    buy_entry, retouch_20 = False, False
-                    # 未執行の買い指値注文があればキャンセル
-                    if len(order) > 0 and order[0]["side"] == "Buy":
-                        await client.post(
-                            "/v2/private/order/cancel",
-                            data={
-                                "symbol": symbol,
-                                "order_id": order[0]["order_id"],
-                            },
-                        )
-
-                # 売り方向のパーフェクトオーダー
-                if (
-                    df_1bf["9EMA"] < df_1bf["20EMA"]
-                    and df_1bf["20EMA"] < df_1bf["100EMA"]
-                ):
-                    # 未執行の注文があればキャンセル
-                    if sell_entry and len(order) > 0:
-                        await client.post(
-                            "/v2/private/order/cancelAll",
-                            data={
-                                "symbol": symbol,
-                            },
-                        )
-                    # 未決済ポジションがあれば決済指値をトレール
-                    if len(position) > 0 and position[0]["side"] == "Sell":
-                        await client.post(
-                            "/v2/private/position/trading-stop",
-                            data={
-                                "symbol": symbol,
-                                "stop_loss": df_1bf["sell_limit"],
-                            },
-                        )
                     else:
-                        # 20EMA再タッチ判定
-                        if sell_entry and not retouch_20:
-                            if (
-                                df_1bf["high"] >= df_1bf["20EMA"]
-                                and df_1bf["20EMA"] > df_1bf["close"]
-                            ) or (
-                                df_2bf["close"] >= df_1bf["20EMA"]
-                                and df_1bf["20EMA"] > df_1bf["close"]
-                            ):
-                                retouch_20 = True
-                        # パーフェクトオーダー後初エントリーまたは20EMA再タッチからエントリー
-                        if not sell_entry or retouch_20:
-                            sell_entry = True
-                            retouch_20 = False
+                        # 未執行の買い指値注文があればキャンセル
+                        if len(order) > 0 and order[0]["side"] == "Buy":
+                            await client.post(
+                                "/v2/private/order/cancel",
+                                data={
+                                    "symbol": symbol,
+                                    "order_id": order[0]["order_id"],
+                                },
+                            )
+
+                    # 売り方向のパーフェクトオーダー
+                    if (
+                        df_1bf["5EMA"] < df_1bf["9EMA"]
+                        and df_1bf["9EMA"] < df_1bf["45EMA"]
+                    ):
+                        # 未執行の売り注文があれば指値変更
+                        if len(order) > 0 and order[0]["side"] == "Sell":
+                            await client.post(
+                                "/v2/private/order/replace",
+                                data={
+                                    "order_id": order[0]["order_id"],
+                                    "symbol": symbol,
+                                    "p_r_price": df_1bf["sell_price"],
+                                    "stop_loss": df_1bf["sell_limit"],
+                                },
+                            )
+                        else:
                             # 新規売り指値注文
                             await client.post(
                                 "/v2/private/order/create",
@@ -250,17 +227,16 @@ async def main():
                                     "time_in_force": "GoodTillCancel",
                                 },
                             )
-                else:
-                    sell_entry, retouch_20 = False, False
-                    # 未執行の売り指値注文があればキャンセル
-                    if len(order) > 0 and order[0]["side"] == "Sell":
-                        await client.post(
-                            "/v2/private/order/cancel",
-                            data={
-                                "symbol": symbol,
-                                "order_id": order[0]["order_id"],
-                            },
-                        )
+                    else:
+                        # 未執行の売り指値注文があればキャンセル
+                        if len(order) > 0 and order[0]["side"] == "Sell":
+                            await client.post(
+                                "/v2/private/order/cancel",
+                                data={
+                                    "symbol": symbol,
+                                    "order_id": order[0]["order_id"],
+                                },
+                            )
 
                 # 確定済みの1分足データはDataStoreからクリアする
                 store.kline._clear()
